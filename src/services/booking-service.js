@@ -4,56 +4,33 @@ const { ServerConfig } = require("../config");
 const db = require("../models");
 const { StatusCodes } = require("http-status-codes");
 const { Enums } = require("../utils/common");
-const {CONFIRMED,CANCELLED,PENDING,INITIATED} = Enums.BOOKING_STATUS;
-
-
+const { CONFIRMED, CANCELLED, INITIATED } = Enums.BOOKING_STATUS;
 
 const { BookingRepository } = require("../repositories");
 
-async function createBooking(data) {
-  const transaction = await db.sequelize.transaction();
 
+
+
+
+
+/**
+ * Helper to safely update flight seats
+ */
+
+async function updateFlightSeats(flightId, seats, increment = false) {
   try {
-    const flightResponse = await axios.get(
-      `${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}`,
-    );
-
-    const flightData = flightResponse.data.data;
-
-    if (flightData.totalSeats < data.noOfSeats) {
-      throw new AppError("Not enough seats available", StatusCodes.BAD_REQUEST);
-    }
-
-    const totalBillingAmount = flightData.price * data.noOfSeats;
-
-    const bookingPayload = {
-      //...data,
-      flightId: data.flightId,
-      userId: data.userId,
-      noOfSeats: data.noOfSeats,
-      totalCost: totalBillingAmount,
-    };
-
-    const bookingRepository = new BookingRepository();
-    const booking = await bookingRepository.createBooking(
-      bookingPayload,
-      transaction,
-    );
-
-    //after payment success only then update the flight seats
-
     await axios.patch(
-      `${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}/seats`,
+      `${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${flightId}/seats`,
       {
-        seats: data.noOfSeats
+        seats,
+        dec: increment ? 0 : 1, // dec=0 → increment, dec=1 → decrement
       },
     );
-
-    await transaction.commit();
-    return booking;
-  } catch (error) {
-    await transaction.rollback();
-    throw error; //  THIS IS MANDATORY
+  } catch (err) {
+    throw new AppError(
+      "Failed to update flight seats. Please try again.",
+      StatusCodes.INTERNAL_SERVER_ERROR,
+    );
   }
 }
 
@@ -62,88 +39,196 @@ async function createBooking(data) {
 
 
 
-async function makePayment(data) {
-    const transaction = await db.sequelize.transaction();
 
-    try {
-        const bookingRepository = new BookingRepository();
+/**
+ * Create a new booking
+ */
+async function createBooking(data) {
+  const transaction = await db.sequelize.transaction();
 
-        const bookingDetails = await bookingRepository.get(
-            data.bookingId,
-            transaction
-        );
+  try {
+    // Lock flight row to prevent race conditions (optional: implement in flight service)
+    const flightResponse = await axios.get(
+      `${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${data.flightId}?lock=true`,
+    );
+    const flightData = flightResponse.data.data;
 
-        // 1️ Already cancelled
-        if (bookingDetails.status === CANCELLED) {
-            throw new AppError(
-                "Booking is already cancelled",
-                StatusCodes.BAD_REQUEST
-            );
-        }
-
-        // 2️ Timeout check (5 minutes)
-        const bookingTime = new Date(bookingDetails.createdAt);
-        const currentTime = new Date();
-
-        if (currentTime - bookingTime > 300000) {
-
-            // cancel booking
-            await bookingRepository.updateBooking(
-                data.bookingId,
-                { status: CANCELLED },
-                transaction
-            );
-
-            //  release seats back to flight service
-            await axios.patch(
-                `${ServerConfig.FLIGHT_SERVICE}/api/v1/flights/${bookingDetails.flightId}/seats`,
-                {
-                    seats: bookingDetails.noOfSeats,
-                    dec: 0 // increment seats
-                }
-            );
-
-            throw new AppError(
-                "Booking cancelled due to timeout. Seats released.",
-                StatusCodes.BAD_REQUEST
-            );
-        }
-
-        // 3️ Amount verification
-        if (Number(bookingDetails.totalCost) !== Number(data.totalCost)) {
-            throw new AppError(
-                "The amount of the payment does not match",
-                StatusCodes.BAD_REQUEST
-            );
-        }
-
-        // 4️ User authorization
-        if (Number(bookingDetails.userId) !== Number(data.userId)) {
-            throw new AppError(
-                "User not authorized to make payment for this booking",
-                StatusCodes.UNAUTHORIZED
-            );
-        }
-
-        // 5️ Payment success → confirm booking
-        const response = await bookingRepository.updateBooking(
-            data.bookingId,
-            { status: CONFIRMED },
-            transaction
-        );
-
-        await transaction.commit();
-        return response;
-
-    } catch (error) {
-        await transaction.rollback();
-        throw error;
+    if (flightData.totalSeats < data.noOfSeats) {
+      throw new AppError("Not enough seats available", StatusCodes.BAD_REQUEST);
     }
+
+    const totalCost = flightData.price * data.noOfSeats;
+
+    const bookingRepository = new BookingRepository();
+    const booking = await bookingRepository.createBooking(
+      {
+        flightId: data.flightId,
+        userId: data.userId,
+        noOfSeats: data.noOfSeats,
+        totalCost,
+        status: INITIATED,
+      },
+      transaction,
+    );
+
+    // Decrement flight seats immediately to reserve
+    await updateFlightSeats(data.flightId, data.noOfSeats);
+
+    await transaction.commit();
+    return booking;
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  }
 }
+
+
+
+
+
+
+
+/**
+ * Make payment for a booking
+ */
+
+async function makePayment(data) {
+  const transaction = await db.sequelize.transaction();
+
+  try {
+    const bookingRepository = new BookingRepository();
+    const booking = await bookingRepository.get(data.bookingId, transaction);
+
+    if (!booking)
+      throw new AppError("Booking not found", StatusCodes.NOT_FOUND);
+
+    if (booking.status === CANCELLED) {
+      throw new AppError(
+        "Booking is already cancelled",
+        StatusCodes.BAD_REQUEST,
+      );
+    }
+
+    // Timeout check (5 minutes)
+    const bookingTime = new Date(booking.createdAt);
+    const currentTime = new Date();
+
+    if (currentTime - bookingTime > 300000) {
+      // Timeout: cancel booking in a separate transaction to persist
+      const timeoutTransaction = await db.sequelize.transaction();
+      await bookingRepository.updateBooking(
+        data.bookingId,
+        { status: CANCELLED },
+        timeoutTransaction,
+      );
+
+      await updateFlightSeats(booking.flightId, booking.noOfSeats, true);
+
+      await timeoutTransaction.commit();
+
+      throw new AppError(
+        "Booking cancelled due to timeout. Seats released.",
+        StatusCodes.BAD_REQUEST,
+      );
+    }
+
+    // Amount check
+    if (Number(data.totalCost) !== Number(booking.totalCost)) {
+      throw new AppError("Payment amount mismatch", StatusCodes.BAD_REQUEST);
+    }
+
+    // User authorization
+    if (Number(data.userId) !== Number(booking.userId)) {
+      throw new AppError("User not authorized", StatusCodes.UNAUTHORIZED);
+    }
+
+    // Payment success → confirm booking
+    const confirmedBooking = await bookingRepository.updateBooking(
+      data.bookingId,
+      { status: CONFIRMED },
+      transaction,
+    );
+
+    await transaction.commit();
+    return confirmedBooking;
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  }
+}
+
+
+
+
+
+/**
+ * Cancel a booking
+ */
+// This can be called by user or by a cron job for old bookings
+// Idempotent: if already cancelled, just return true
+async function cancelBooking(bookingId) {
+  const transaction = await db.sequelize.transaction();
+
+  try {
+    const bookingRepository = new BookingRepository();
+    const booking = await bookingRepository.get(bookingId, transaction);
+
+    if (!booking)
+      throw new AppError("Booking not found", StatusCodes.NOT_FOUND);
+
+    if (booking.status === CANCELLED) {
+      await transaction.commit();
+      return true; // idempotent
+    }
+
+    // Release seats
+    await updateFlightSeats(booking.flightId, booking.noOfSeats, true);
+
+    // Update status
+    await bookingRepository.updateBooking(
+      bookingId,
+      { status: CANCELLED },
+      transaction,
+    );
+
+    await transaction.commit();
+    return true;
+  } catch (error) {
+    await transaction.rollback();
+    throw error;
+  }
+}
+
+
+
+
+/// Cancel old bookings that are still in INITIATED status after 5 minutes
+// This function is called by a cron job every 10 seconds
+async function cancelOldBookings() {
+  const bookingRepository = new BookingRepository();
+
+  try {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+
+    const cancelledCount =
+      await bookingRepository.cancelOldBookings(fiveMinutesAgo);
+
+    return cancelledCount;
+  } catch (error) {
+    throw new AppError(
+      "Failed to cancel old bookings",
+      StatusCodes.INTERNAL_SERVER_ERROR
+    );
+  }
+}
+
+
 
 
 
 module.exports = {
   createBooking,
-    makePayment,
+  makePayment,
+  cancelBooking,
+cancelOldBookings,
 };
