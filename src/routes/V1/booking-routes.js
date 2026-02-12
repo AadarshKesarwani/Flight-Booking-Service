@@ -9,7 +9,7 @@ const { BookingController } = require('../../controllers');
 router.post("/", BookingController.createBooking);
 
 
-
+router.post("/payment", BookingController.makePayment);
 
 
 
